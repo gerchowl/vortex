@@ -4,18 +4,18 @@
 mod kernel;
 mod prepared;
 
-use std::cmp::Ordering;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
 use std::iter;
 use std::ops::BitOr;
-use std::sync::Arc;
 
 use arrow_buffer::bit_iterator::BitIndexIterator;
 pub use kernel::*;
 use num_traits::Zero;
 pub use prepared::PreparedSet;
+pub use prepared::PreparedSetArray;
+pub use prepared::PreparedSetData;
 use prost::Message;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
@@ -51,6 +51,7 @@ use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ReduceNode;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -207,26 +208,60 @@ impl ScalarFnVTable for ListContains {
         let value_array = args.get(1)?;
 
         // Borrow the list: a constant list scalar owns every element, so cloning it is not free.
-        if let Some(list) = list_array.as_opt::<Constant>()
+        if let Some(list) = constant_list(&list_array)
             && let Some(value_scalar) = value_array.as_constant()
         {
-            let result = compute_contains_scalar(list.scalar(), &value_scalar, options)?;
+            let result = compute_contains_scalar(list, &value_scalar, options)?;
             return Ok(ConstantArray::new(result, args.row_count()).into_array());
         }
 
         compute_list_contains(&list_array, &value_array, options, ctx)
     }
 
-    fn simplify_untyped(
-        &self,
-        options: &Self::Options,
-        expr: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        let Some(list) = expr.child(0).as_opt::<Literal>() else {
+    /// A constant list and a constant needle fold to their constant answer, in expression and
+    /// array trees alike. A [`PreparedSetArray`] list folds through its own parent rule.
+    fn reduce<T: ReduceNode>(&self, options: &Self::Options, node: &T) -> VortexResult<Option<T>> {
+        let Some(list) = node.child(0).as_constant() else {
             return Ok(None);
         };
-        Ok(normalized_set(list, options)
-            .map(|list| ListContains.new_expr(*options, [lit(list), expr.child(1).clone()])))
+        let Some(needle) = node.child(1).as_constant() else {
+            return Ok(None);
+        };
+        let result = compute_contains_scalar(&list, &needle, options)?;
+        Ok(Some(node.new_constant(result)))
+    }
+
+    /// The validity of `needle IN list` for a literal list, decided without a probe.
+    ///
+    /// Off SQL null semantics only a null needle gives null, unless the list is empty, which
+    /// answers `false` for every needle. Under them a null element can give null too, by leaving
+    /// a non-match unknown, so only a list without one is decided from the needle alone. A null
+    /// list gives null for every needle.
+    ///
+    /// Without this the validity of a node over a constant list would execute the node, which
+    /// prepares the list as a set only to read the validity off the result.
+    fn validity(
+        &self,
+        options: &Self::Options,
+        expression: &Expression,
+    ) -> VortexResult<Option<Expression>> {
+        let Some(list) = expression.child(0).as_opt::<Literal>() else {
+            return Ok(None);
+        };
+        if !matches!(list.dtype(), DType::List(..)) {
+            return Ok(None);
+        }
+        let Some(elements) = list.as_list().element_values() else {
+            return Ok(Some(lit(false)));
+        };
+
+        if options.sql_null_semantics && elements.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+        if elements.is_empty() && !options.sql_null_semantics {
+            return Ok(Some(lit(true)));
+        }
+        Ok(Some(expression.child(1).validity()?))
     }
 
     // Off SQL null semantics an empty list answers `false` even for a null needle; on them a null
@@ -238,56 +273,6 @@ impl ScalarFnVTable for ListContains {
     fn is_infallible(&self, _options: &Self::Options) -> bool {
         true
     }
-}
-
-/// A constant list rewritten into the form a set probe wants — its elements sorted, without
-/// duplicates, and with at most one null — or `None` when it is in that form already or its
-/// elements have no total order.
-///
-/// Neither the order of the elements nor their repetition changes a membership test, and one null
-/// element decides as much as many. Whether a null survives does matter: under SQL null semantics
-/// it makes a non-match unknown, and off them a list of nothing but nulls is still not empty, which
-/// a null needle tells apart.
-///
-/// Normalizing once, while the expression is optimized, spares every batch the sort.
-fn normalized_set(list: &Scalar, options: &ListContainsOptions) -> Option<Scalar> {
-    let DType::List(element_dtype, nullability) = list.dtype() else {
-        return None;
-    };
-    if !matches!(
-        element_dtype.as_ref(),
-        DType::Bool(_)
-            | DType::Primitive(..)
-            | DType::Decimal(..)
-            | DType::Utf8(_)
-            | DType::Binary(_)
-    ) {
-        return None;
-    }
-    let elements = list.as_list().elements()?;
-
-    let had_null = elements.iter().any(Scalar::is_null);
-    let mut set: Vec<Scalar> = elements
-        .iter()
-        .filter(|element| !element.is_null())
-        .cloned()
-        .collect();
-    let mut incomparable = false;
-    set.sort_by(|a, b| {
-        a.partial_cmp(b).unwrap_or_else(|| {
-            incomparable = true;
-            Ordering::Equal
-        })
-    });
-    if incomparable {
-        return None;
-    }
-    set.dedup();
-    if had_null && (options.sql_null_semantics || set.is_empty()) {
-        set.push(Scalar::null(element_dtype.as_ref().clone()));
-    }
-
-    (set != elements).then(|| Scalar::list(Arc::clone(element_dtype), set, *nullability))
 }
 
 fn compute_contains_scalar(
@@ -360,13 +345,35 @@ fn compute_list_contains(
         return list_contains_scalar(array, &value_scalar, nullability, options, ctx);
     }
 
-    if !array.is::<Constant>() {
-        return lists_contain_needles(array, value, nullability, options, ctx);
+    if let Some(set) = array.as_opt::<PreparedSet>() {
+        return set.contains(value, options, ctx);
     }
 
-    let set = ListContainsSet::try_new(array, value.dtype(), options, ctx)?
-        .ok_or_else(|| vortex_err!("A non-null constant list of {} has a set", value.dtype()))?;
-    set.prepare(ctx)?.contains(value, ctx)
+    if let Some(list) = array.as_opt::<Constant>() {
+        let set = PreparedSetArray::try_new(list.scalar().clone(), array.len(), ctx)?;
+
+        // A canonical needle has no encoding for a kernel to use, so probe it now.
+        if value.is_canonical() {
+            return set.data().contains(value, options, ctx);
+        }
+
+        // Give the prepared set back to the executor. Thus a kernel of the needle encoding can
+        // probe it, for example on the values of a dictionary only. When no kernel does, the next
+        // execution finds the prepared set above and probes it, so this happens at most once.
+        return Ok(
+            ListContains::try_new_opts(set.into_array(), value.clone(), *options)?.into_array(),
+        );
+    }
+
+    lists_contain_needles(array, value, nullability, options, ctx)
+}
+
+/// The list that every row of `array` holds, when the array is a constant or a prepared set.
+fn constant_list(array: &ArrayRef) -> Option<&Scalar> {
+    if let Some(constant) = array.as_opt::<Constant>() {
+        return Some(constant.data().scalar());
+    }
+    array.as_opt::<PreparedSet>().map(|set| set.data().list())
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -789,6 +796,7 @@ mod tests {
     use crate::expr::get_item;
     use crate::expr::gt;
     use crate::expr::in_list;
+    use crate::expr::is_not_null;
     use crate::expr::list_contains;
     use crate::expr::list_contains_opts;
     use crate::expr::lit;
@@ -796,6 +804,7 @@ mod tests {
     use crate::expr::or;
     use crate::expr::root;
     use crate::expr::stats::Stat;
+    use crate::optimizer::ArrayOptimizer;
     use crate::scalar::PValue;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::list_contains::ListContains;
@@ -1653,81 +1662,6 @@ mod tests {
         assert_rows_agree(result, BoolArray::from_iter([true, false]))
     }
 
-    fn optimized_set(expr: &Expression) -> VortexResult<Scalar> {
-        let optimized = expr.optimize_recursive(&DType::Primitive(I32, Nullability::Nullable))?;
-        Ok(optimized
-            .child(0)
-            .as_opt::<Literal>()
-            .vortex_expect("the set stays a literal")
-            .clone())
-    }
-
-    #[rstest]
-    // Off SQL null semantics a null element next to others decides nothing.
-    #[case::default(ListContainsOptions::default(), vec![Some(3), Some(1), None, Some(3), Some(2)], vec![Some(1), Some(2), Some(3)])]
-    // On them one null is kept, last, to leave a non-match unknown.
-    #[case::sql(SQL, vec![Some(3), None, Some(1), None, Some(3)], vec![Some(1), Some(3), None])]
-    // A list of nothing but nulls keeps one, since an empty list answers a null needle apart.
-    #[case::only_nulls(ListContainsOptions::default(), vec![None, None], vec![None])]
-    fn optimize_normalizes_the_set(
-        #[case] options: ListContainsOptions,
-        #[case] set: Vec<Option<i32>>,
-        #[case] expected: Vec<Option<i32>>,
-    ) -> VortexResult<()> {
-        let expr = list_contains_opts(lit(i32_set(set)), root(), options);
-        assert_eq!(optimized_set(&expr)?, i32_set(expected.clone()));
-        // A normalized set is left alone, so optimization reaches a fixed point.
-        let normalized = list_contains_opts(lit(i32_set(expected.clone())), root(), options);
-        assert_eq!(optimized_set(&normalized)?, i32_set(expected));
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::default(ListContainsOptions::default())]
-    #[case::sql(SQL)]
-    fn optimize_keeps_the_answer(#[case] options: ListContainsOptions) -> VortexResult<()> {
-        // Floats compare bitwise: `-0.0` and `0.0` stay distinct members, and NaN is one member.
-        let element = DType::Primitive(PType::F64, Nullability::Nullable);
-        let set = Scalar::list(
-            Arc::new(element.clone()),
-            [
-                Some(2.0),
-                Some(f64::NAN),
-                None,
-                Some(-0.0),
-                Some(2.0),
-                Some(f64::NAN),
-            ]
-            .into_iter()
-            .map(|v| match v {
-                Some(v) => Scalar::primitive(v, Nullability::Nullable),
-                None => Scalar::null(element.clone()),
-            })
-            .collect(),
-            Nullability::NonNullable,
-        );
-        let needles = PrimitiveArray::from_option_iter([
-            Some(2.0f64),
-            Some(0.0),
-            Some(-0.0),
-            Some(f64::NAN),
-            Some(5.0),
-            None,
-        ])
-        .into_array();
-        let expr = list_contains_opts(lit(set), root(), options);
-        let optimized = expr.optimize_recursive(needles.dtype())?;
-        assert_ne!(optimized, expr, "the set is normalized");
-
-        let mut ctx = array_session().create_execution_ctx();
-        let expected = needles
-            .clone()
-            .apply(&expr)?
-            .execute::<BoolArray>(&mut ctx)?;
-        assert_arrays_eq!(needles.apply(&optimized)?, expected, &mut ctx);
-        Ok(())
-    }
-
     /// Probes `set` with each element, its neighbours and the type's extremes, against a naive
     /// oracle.
     fn assert_integer_membership<T>(set: Vec<T>) -> VortexResult<()>
@@ -2045,6 +1979,65 @@ mod tests {
         assert_eq!(
             ListContains.deserialize(&[], &session)?,
             ListContainsOptions::default()
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::default(ListContainsOptions::default(), Some(false))]
+    #[case::sql(SQL, None)]
+    fn constant_needle_in_constant_set_folds_to_a_constant(
+        #[case] options: ListContainsOptions,
+        #[case] expected: Option<bool>,
+    ) -> VortexResult<()> {
+        // `3 IN (2, NULL)` is decided at optimization, in an expression and in an array tree.
+        let set = i32_set(vec![Some(2), None]);
+        let needle = Scalar::primitive(3i32, Nullability::Nullable);
+        let expected = match expected {
+            Some(value) => Scalar::bool(value, Nullability::Nullable),
+            None => Scalar::null(DType::Bool(Nullability::Nullable)),
+        };
+
+        let expr = list_contains_opts(lit(set.clone()), lit(needle.clone()), options)
+            .bind(&DType::Primitive(I32, Nullability::Nullable))?
+            .optimize()?;
+        assert_eq!(expr.as_opt::<Literal>(), Some(&expected));
+
+        let array = ListContains::try_new_opts(
+            ConstantArray::new(set, 3).into_array(),
+            ConstantArray::new(needle, 3).into_array(),
+            options,
+        )?
+        .into_array()
+        .optimize()?;
+        assert_eq!(array.as_constant(), Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn validity_of_a_constant_set_needs_no_probe() -> VortexResult<()> {
+        // Off SQL null semantics the needle alone decides validity. Under them a null element
+        // makes validity depend on the probe, which only the fallback computes.
+        let needle = col("a");
+        let with_null = lit(i32_set(vec![Some(2), None]));
+        let without_null = lit(i32_set(vec![Some(2)]));
+
+        let expr = list_contains(with_null.clone(), needle.clone());
+        assert_eq!(expr.validity()?, needle.validity()?);
+        let expr = in_list(needle.clone(), without_null);
+        assert_eq!(expr.validity()?, needle.validity()?);
+        let expr = in_list(needle.clone(), with_null);
+        assert_eq!(expr.validity()?, is_not_null(expr));
+
+        let expr = list_contains(lit(empty_i32_list()), needle.clone());
+        assert_eq!(expr.validity()?, lit(true));
+        let null_list = Scalar::null(DType::List(
+            Arc::new(DType::Primitive(I32, Nullability::Nullable)),
+            Nullability::Nullable,
+        ));
+        assert_eq!(
+            list_contains(lit(null_list), needle).validity()?,
+            lit(false)
         );
         Ok(())
     }

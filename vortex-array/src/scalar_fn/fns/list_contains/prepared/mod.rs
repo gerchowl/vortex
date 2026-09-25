@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Probing a constant set: the probe structure is built from a [`ListContainsSet`] for canonical
-//! evaluation. Chunked expressions dispatch per chunk so each encoding can specialize membership.
+//! Probing a constant set. [`PreparedSetArray`] holds a constant list together with the probe
+//! built from its elements, so that the kernels of a needle encoding can probe their own values.
+
+mod array;
 
 use std::hash::BuildHasher;
 
+pub use array::PreparedSet;
+pub use array::PreparedSetArray;
+pub use array::PreparedSetData;
 use num_traits::ToPrimitive;
 use num_traits::WrappingSub;
 use vortex_buffer::BitBuffer;
@@ -39,7 +44,6 @@ use crate::match_each_integer_ptype;
 use crate::scalar::DecimalValue;
 use crate::scalar_fn::fns::binary::build_row_comparator;
 use crate::scalar_fn::fns::binary::collect_bits;
-use crate::scalar_fn::fns::list_contains::ListContainsSet;
 use crate::validity::Validity;
 
 /// A set whose span of values needs at most this many bits per element is probed through a bitmap
@@ -48,18 +52,12 @@ const BITMAP_BITS_PER_ELEMENT: u128 = 64;
 /// A span this narrow is probed through a bitmap whatever the size of the set.
 const BITMAP_MIN_BITS: u128 = 1 << 12;
 
-/// A [`ListContainsSet`] with the structure that probes it, prepared once and then run over any
-/// number of needle arrays of the set's dtype.
+/// The structure that probes the non-null elements of a set.
 ///
 /// Every needle is probed against a bitmap, a sorted set or a hash table. Decimals use their
 /// unscaled integers with the same bitmap and sorted-value strategy as primitives. Nested
 /// values use sorted row indices with the same comparator as equality. No probe constructs
 /// per-element expressions or materializes scalars in its loop.
-pub struct PreparedSet {
-    set: ListContainsSet,
-    probe: Probe,
-}
-
 enum Probe {
     /// Integers, or floats by their bit patterns, spanning a dense range: one bit per value of the
     /// span above `min_offset`, the smallest element as a `usize`.
@@ -91,15 +89,13 @@ enum Probe {
     },
 }
 
-impl ListContainsSet {
-    /// Builds the structure that probes this set.
-    pub fn prepare(self, ctx: &mut ExecutionCtx) -> VortexResult<PreparedSet> {
-        let probe = match self.elements().dtype() {
+impl Probe {
+    /// Builds the structure that probes the non-null `elements`.
+    fn try_new(elements: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
+        Ok(match elements.dtype() {
             DType::Primitive(ptype, _) => {
                 let ptype = bit_pattern_ptype(*ptype);
-                let elements = self
-                    .elements()
-                    .clone()
+                let elements = elements
                     .execute::<PrimitiveArray>(ctx)?
                     .reinterpret_cast(ptype);
                 match_each_integer_ptype!(ptype, |T| {
@@ -107,7 +103,7 @@ impl ListContainsSet {
                 })
             }
             DType::Decimal(..) => {
-                let elements = self.elements().clone().execute::<DecimalArray>(ctx)?;
+                let elements = elements.execute::<DecimalArray>(ctx)?;
                 match_each_decimal_value_type!(elements.values_type(), |T| {
                     let values = elements.buffer::<T>();
                     if let Some((min, bitmap)) = integer_bitmap(&values, ctx.allocator()) {
@@ -125,15 +121,10 @@ impl ListContainsSet {
                 })
             }
             DType::Utf8(_) | DType::Binary(_) => {
-                bytes_probe(self.elements().clone().execute::<VarBinViewArray>(ctx)?)
+                bytes_probe(elements.execute::<VarBinViewArray>(ctx)?)
             }
             _ => {
-                let elements = self
-                    .elements()
-                    .clone()
-                    .execute::<RecursiveCanonical>(ctx)?
-                    .0
-                    .into_array();
+                let elements = elements.execute::<RecursiveCanonical>(ctx)?.0.into_array();
                 let mut indices: Vec<usize> = (0..elements.len()).collect();
                 if !indices.is_empty() {
                     let compare = build_row_comparator(&elements, &elements, ctx)?;
@@ -144,22 +135,17 @@ impl ListContainsSet {
                 }
                 Probe::Rows { elements, indices }
             }
-        };
-        Ok(PreparedSet { set: self, probe })
-    }
-}
-
-impl PreparedSet {
-    /// The dtype of every result, as the expression declares it.
-    pub fn dtype(&self) -> DType {
-        DType::Bool(self.set.nullability)
+        })
     }
 
-    /// Whether each of `needles`, which have the set's dtype, is a member of the set.
-    ///
-    /// The result has the nullability the expression declares, whatever the needles' encoding.
-    pub fn contains(&self, needles: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
-        match &self.probe {
+    /// One membership bit per needle, and the validity of the needles, which have the dtype of the
+    /// elements.
+    fn contains(
+        &self,
+        needles: &ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<(BitBuffer, Validity)> {
+        match self {
             Probe::Bitmap { .. } | Probe::Sorted(_) => self.contains_primitive(needles, ctx),
             Probe::DecimalBitmap { .. } | Probe::DecimalSorted(_) => {
                 self.contains_decimal(needles, ctx)
@@ -168,9 +154,9 @@ impl PreparedSet {
                 elements,
                 hasher,
                 table,
-            } => self.contains_bytes(elements, hasher, table, needles, ctx),
+            } => Self::contains_bytes(elements, hasher, table, needles, ctx),
             Probe::Rows { elements, indices } => {
-                self.contains_rows(elements, indices, needles, ctx)
+                Self::contains_rows(elements, indices, needles, ctx)
             }
         }
     }
@@ -182,26 +168,25 @@ impl PreparedSet {
         &self,
         needles: &ArrayRef,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    ) -> VortexResult<(BitBuffer, Validity)> {
         let primitive = needles.clone().execute::<PrimitiveArray>(ctx)?;
         let ptype = bit_pattern_ptype(primitive.ptype());
         let values = primitive.reinterpret_cast(ptype);
         let bits = match_each_integer_ptype!(ptype, |T| {
-            self.probe
-                .integer_bits(values.as_slice::<T>(), ctx.allocator())
+            self.integer_bits(values.as_slice::<T>(), ctx.allocator())
         });
-        self.set.finish(bits, primitive.validity()?)
+        Ok((bits, primitive.validity()?))
     }
 
     fn contains_decimal(
         &self,
         needles: &ArrayRef,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    ) -> VortexResult<(BitBuffer, Validity)> {
         let needles = needles.clone().execute::<DecimalArray>(ctx)?;
         // Logical precision and scale agree, but physical widths can differ. Widen once to
         // the common width so out-of-range needles cannot truncate into false matches.
-        let bits = match &self.probe {
+        let bits = match self {
             Probe::DecimalBitmap { min, bitmap } => {
                 let common = min.decimal_type().max(needles.values_type());
                 match_each_decimal_value_type!(common, |T| {
@@ -210,9 +195,9 @@ impl PreparedSet {
                     collect_bits(
                         &values,
                         |value| {
-                            value.offset_from(min).is_some_and(|offset| {
-                                offset < bitmap.len() && bitmap.value(offset)
-                            })
+                            value
+                                .offset_from(min)
+                                .is_some_and(|offset| offset < bitmap.len() && bitmap.value(offset))
                         },
                         ctx.allocator(),
                     )
@@ -228,17 +213,16 @@ impl PreparedSet {
             }
             _ => unreachable!("decimal needles meet a decimal probe"),
         };
-        self.set.finish(bits, needles.validity()?)
+        Ok((bits, needles.validity()?))
     }
 
     fn contains_bytes(
-        &self,
         elements: &VarBinViewArray,
         hasher: &RandomState,
         table: &HashTable<u32>,
         needles: &ArrayRef,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    ) -> VortexResult<(BitBuffer, Validity)> {
         let element_views = elements.views();
         let element_buffers = data_buffers(elements);
         let array = needles.clone().execute::<VarBinViewArray>(ctx)?;
@@ -255,21 +239,20 @@ impl PreparedSet {
             },
             ctx.allocator(),
         );
-        self.set.finish(bits, array.validity()?)
+        Ok((bits, array.validity()?))
     }
 
     fn contains_rows(
-        &self,
         elements: &ArrayRef,
         indices: &[usize],
         needles: &ArrayRef,
         ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
+    ) -> VortexResult<(BitBuffer, Validity)> {
         if indices.is_empty() {
-            return self.set.finish(
+            return Ok((
                 BitBuffer::full_in(false, needles.len(), ctx.allocator().clone()),
                 needles.validity()?,
-            );
+            ));
         }
         let needles = needles
             .clone()
@@ -288,11 +271,9 @@ impl PreparedSet {
             },
             ctx.allocator().clone(),
         );
-        self.set.finish(bits, needles.validity()?)
+        Ok((bits, needles.validity()?))
     }
-}
 
-impl Probe {
     /// One bit per needle, set when the needle is an element.
     fn integer_bits<T: IntegerPType>(
         &self,
