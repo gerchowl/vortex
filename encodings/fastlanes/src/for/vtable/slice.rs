@@ -23,24 +23,14 @@ impl SliceReduce for FoR {
             ));
         }
 
-        // Slicing is zero-copy: `encoded` is sliced by row, `references` by chunk, and the new
-        // `offset` records where the first remaining row sits within its chunk.
+        // Keep the references of the chunks the slice overlaps, and record how far into the first
+        // of them the slice starts.
         //
-        // `start` and `end` are the requested range measured from the start of the first chunk,
-        // so the array's own `offset` is added to it. The chunks overlapping `start..end` are
-        // kept, and the new offset is the position of `start` within its chunk.
+        // E.g. rows 1500..2500 of a 3000-row array with references [r0, r1, r2]:
+        //   references = [r1, r2]  (the slice overlaps chunks 1 and 2)
+        //   offset     = 476       (row 1500 is 476 rows into chunk 1)
         //
-        // For example, an array with `offset = 476` and references `[r1, r2]` (itself the slice
-        // `1500..2500` of a 3000-row array with references `[r0, r1, r2]`) sliced to `600..900`:
-        //
-        //   start      = 476 + 600 = 1076
-        //   end        = 476 + 900 = 1376
-        //   references = [r1, r2].slice(1076 / 1024 .. ceil(1376 / 1024))
-        //              = [r1, r2].slice(1..2) = [r2]
-        //   offset     = 1076 % 1024 = 52
-        //
-        // Row 0 of the result is row 2100 of the original array, which is 52 rows into the
-        // original chunk 2 (rows 2048..3000), whose reference is `r2`.
+        // Adding the array's own offset first makes this work for already-sliced arrays too.
         let start = usize::from(array.offset()) + range.start;
         let end = usize::from(array.offset()) + range.end;
         let references = array
