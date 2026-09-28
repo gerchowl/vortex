@@ -22,6 +22,7 @@ use vortex_buffer::BufferMut;
 use vortex_compute::lane_kernels::IndexedSource;
 use vortex_compute::lane_kernels::IndexedSourceExt;
 use vortex_compute::lane_kernels::LaneZip;
+use vortex_compute::lane_kernels::Repeat;
 use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
@@ -134,33 +135,6 @@ impl TimePart {
             .cast(DType::Primitive(PType::I32, Nullability::NonNullable))?
             .execute::<PrimitiveArray>(ctx)?;
         Ok(Self::Values(values))
-    }
-}
-
-/// An [`IndexedSource`] that yields the same value for every lane.
-#[derive(Clone, Copy)]
-struct Repeat {
-    value: i64,
-    len: usize,
-}
-
-impl Repeat {
-    fn new(value: i64, len: usize) -> Self {
-        Self { value, len }
-    }
-}
-
-impl IndexedSource for Repeat {
-    type Item = i64;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    unsafe fn get_unchecked(&self, _i: usize) -> i64 {
-        self.value
     }
 }
 
