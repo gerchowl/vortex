@@ -5,6 +5,7 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use fsst::Decompressor;
+use num_traits::ToPrimitive;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
@@ -85,7 +86,7 @@ impl FsstDecodePlan {
             lengths
                 .as_slice::<P>()
                 .iter()
-                .try_fold(0usize, |acc, &x| acc.checked_add(usize::try_from(x).ok()?))
+                .try_fold(0usize, |acc, &x| acc.checked_add(x.to_usize()?))
         })
         .ok_or_else(|| vortex_err!("FSST uncompressed lengths are negative or overflow"))?;
 

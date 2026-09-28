@@ -9,6 +9,7 @@
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
+use num_traits::ToPrimitive;
 use onpair::CompactDictionaryView;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
@@ -72,7 +73,7 @@ impl<'a> OnPairDecodePlan<'a> {
             lengths
                 .as_slice::<P>()
                 .iter()
-                .try_fold(0usize, |acc, &l| acc.checked_add(usize::try_from(l).ok()?))
+                .try_fold(0usize, |acc, &l| acc.checked_add(l.to_usize()?))
         })
         .ok_or_else(|| vortex_err!("OnPair uncompressed lengths are negative or overflow"))?;
 
