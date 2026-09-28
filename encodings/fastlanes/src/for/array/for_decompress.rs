@@ -17,6 +17,7 @@ use vortex_array::dtype::PhysicalPType;
 use vortex_array::dtype::UnsignedPType;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
+use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -54,10 +55,21 @@ impl<T: PhysicalPType<Physical = T> + FoR> UnpackStrategy<T> for FoRStrategy<T> 
 }
 
 pub fn decompress(array: &FoRArray, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    match array.constant_reference() {
+        Some(reference) => decompress_one_ref(array, &reference, ctx),
+        None => {
+            match_each_integer_ptype!(array.ptype(), |T| { decompress_many_refs::<T>(array, ctx) })
+        }
+    }
+}
+
+/// Decompress an array whose chunks all share `reference`.
+fn decompress_one_ref(
+    array: &FoRArray,
+    reference: &Scalar,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
     let ptype = array.ptype();
-    let Some(reference) = array.constant_reference() else {
-        return match_each_integer_ptype!(ptype, |T| { decompress_chunked::<T>(array, ctx) });
-    };
 
     // Try to do fused unpack.
     if ptype.is_unsigned_int()
@@ -89,7 +101,7 @@ pub fn decompress(array: &FoRArray, ctx: &mut ExecutionCtx) -> VortexResult<Prim
 }
 
 /// Decompress an array whose chunks have different references.
-fn decompress_chunked<T: NativePType + WrappingAdd + PrimInt>(
+fn decompress_many_refs<T: NativePType + WrappingAdd + PrimInt>(
     array: &FoRArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
