@@ -247,33 +247,19 @@ fn serialization_requires_v2_permission() -> VortexResult<()> {
 #[test]
 fn bare_vtable_refuses_serde() -> VortexResult<()> {
     let session = array_session();
-    session.arrays().register(DecimalByteParts);
-    let msp = msp();
-    let array = DecimalByteParts::try_new(msp.clone(), DecimalDType::new(19, 2))?.into_array();
+    let array = DecimalByteParts::try_new(msp(), DecimalDType::new(19, 2))?.into_array();
     let result = session.array_serialize(&array);
     assert!(
         result.as_ref().is_err_and(|err| err
             .to_string()
-            .contains("DecimalByteParts serialization requires DecimalBytePartsPlugin")),
-        "expected unsupported VTable serialization, got {result:?}"
+            .contains("is not registered for serialization")),
+        "expected serialization without DecimalBytePartsPlugin to fail, got {result:?}"
     );
 
     let id = VTable::id(&DecimalByteParts);
-    let plugin = session
-        .arrays()
-        .registry()
-        .get(&id)
-        .vortex_expect("registered");
-    let children = vec![msp];
-    let result = plugin.deserialize(
-        ArrayDeserialization::new(id, array.dtype(), array.len(), &[8, 7], &[], &children),
-        &session,
-    );
     assert!(
-        result.as_ref().is_err_and(|err| err
-            .to_string()
-            .contains("DecimalByteParts deserialization requires DecimalBytePartsPlugin")),
-        "expected unsupported VTable deserialization, got {result:?}"
+        session.arrays().registry().get(&id).is_none(),
+        "DecimalByteParts must not be deserializable without DecimalBytePartsPlugin"
     );
     Ok(())
 }
