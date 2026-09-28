@@ -11183,6 +11183,7 @@ dependencies = [
  "vortex-alp",
  "vortex-array",
  "vortex-buffer",
+ "vortex-compute",
  "vortex-error",
  "vortex-fastlanes",
  "vortex-mask",
