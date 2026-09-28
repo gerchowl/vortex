@@ -167,10 +167,7 @@ fn fill_null_canonical(
 ) -> VortexResult<ArrayRef> {
     let arr = canonical.to_array_ref();
     if let Some(result) = short_circuit(&arr, fill_value)? {
-        // The short circuit can return a lazy `ScalarFn`, so this forces it for now.
-        // TODO(aduffy): Remove this once we have better driver check. We're also implicitly
-        //  relying on the fact that Cast execution will do an optimize on its result.
-        return result.execute::<ArrayRef>(ctx);
+        return Ok(result);
     }
     match canonical {
         CanonicalView::Bool(a) => <Bool as FillNullKernel>::fill_null(a, fill_value, ctx)?
