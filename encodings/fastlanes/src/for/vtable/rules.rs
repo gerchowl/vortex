@@ -36,6 +36,7 @@ impl ArrayParentReduceRule<FoR> for FoRFilterPushDownRule {
         parent: ArrayView<'_, Filter>,
         _child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
+        // TODO(mk): support many references.
         let Some(reference) = child.constant_reference() else {
             return Ok(None);
         };

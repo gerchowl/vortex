@@ -69,6 +69,8 @@ where
         return Ok(None);
     }
 
+    // TODO(mk): support many references.
+
     let Some(reference) = lhs.constant_reference() else {
         return Ok(None);
     };

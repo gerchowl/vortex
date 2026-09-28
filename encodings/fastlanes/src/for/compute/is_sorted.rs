@@ -34,6 +34,7 @@ impl DynAggregateKernel for FoRIsSortedKernel {
         let Some(array) = batch.as_opt::<FoR>() else {
             return Ok(None);
         };
+        // TODO(mk): support many references.
         if array.constant_reference().is_none() {
             return Ok(None);
         }

@@ -25,6 +25,7 @@ impl TakeExecute for FoR {
         indices: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
+        // TODO(mk): support many references.
         let Some(reference) = array.constant_reference() else {
             return Ok(None);
         };
@@ -36,6 +37,7 @@ impl TakeExecute for FoR {
 
 impl FilterReduce for FoR {
     fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
+        // TODO(mk): support many references.
         let Some(reference) = array.constant_reference() else {
             return Ok(None);
         };

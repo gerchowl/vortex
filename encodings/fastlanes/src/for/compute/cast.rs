@@ -21,6 +21,7 @@ impl CastReduce for FoR {
 
         // For type changes between integers, cast the components
         let casted_child = array.encoded().cast(dtype.clone())?;
+        // References are always non-nullable.
         let casted_references = array.references().cast(dtype.as_nonnullable())?;
 
         Ok(Some(
