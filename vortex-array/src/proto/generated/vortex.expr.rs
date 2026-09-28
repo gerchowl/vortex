@@ -177,6 +177,11 @@ pub struct LikeOpts {
     #[prost(bool, tag = "2")]
     pub case_insensitive: bool,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListContainsOpts {
+    #[prost(bool, tag = "1")]
+    pub sql_null_semantics: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CastOpts {
     #[prost(message, optional, tag = "1")]
