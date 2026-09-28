@@ -971,10 +971,11 @@ mod tests {
         let bp = BitPacked::encode(for_arr.encoded(), 6, &mut ctx)?;
 
         let tree = ALP::new(
-            FoR::try_new_chunked(
+            FoR::try_new(
                 bp.into_array(),
-                for_arr.references().clone(),
-                for_arr.offset(),
+                for_arr
+                    .constant_reference()
+                    .vortex_expect("constant reference"),
             )?
             .into_array(),
             exponents,
@@ -1909,10 +1910,11 @@ mod tests {
         let bp = BitPacked::encode(for_arr.encoded(), 6, &mut ctx)?;
 
         let tree = ALP::new(
-            FoR::try_new_chunked(
+            FoR::try_new(
                 bp.into_array(),
-                for_arr.references().clone(),
-                for_arr.offset(),
+                for_arr
+                    .constant_reference()
+                    .vortex_expect("constant reference"),
             )?
             .into_array(),
             exponents,
