@@ -40,9 +40,9 @@ def main() -> None:
         print(f"No benchmark directories found matching: {args.benchmark}", file=sys.stderr)
         sys.exit(1)
 
-    # Formats to capture (vortex formats only, not parquet/duckdb)
+    # Formats to capture (not duckdb)
     # Note: "vortex" CLI arg maps to "vortex-file-compressed" directory name
-    formats_to_capture = {"vortex-file-compressed", "vortex-compact"}
+    formats_to_capture = {"vortex-file-compressed", "vortex-compact", "parquet"}
 
     records = []
 
