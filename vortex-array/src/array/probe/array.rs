@@ -13,6 +13,7 @@ use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array::probe::RepeatedArrayProbe;
 use crate::array::probe::RepeatedState;
+use crate::array::probe::RetainedValidity;
 use crate::array::probe::repeated::child_probe;
 use crate::arrays::Primitive;
 use crate::scalar::Scalar;
@@ -76,15 +77,16 @@ impl ArrayProbe<'_> {
 }
 
 /// One-off scalar read: nothing outlives the call.
+///
+/// Nullness is the encoding's to resolve, so a wrapper encoding that reads through a child walks
+/// the tree once rather than once for validity and again for the value.
 #[inline]
 fn execute_scalar_once(
     array: &ArrayRef,
     index: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Scalar> {
-    if !execute_is_valid_once(array, index, ctx)? {
-        return Ok(Scalar::null(array.dtype().clone()));
-    }
+    check_bounds(array, index)?;
     check_dtype(
         array,
         array.dyn_array().probe_scalar_once(array, index, ctx),
@@ -99,6 +101,13 @@ fn execute_is_valid_once(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<bool> {
     check_bounds(array, index)?;
+    is_valid_once(array, index, ctx)
+}
+
+/// Whether row `index` of `array` is valid, resolving the validity afresh. Bounds have been
+/// checked.
+#[inline]
+fn is_valid_once(array: &ArrayRef, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
     if !array.dtype().is_nullable() {
         return Ok(true);
     }
@@ -150,7 +159,13 @@ pub type EncodingProbeState<V> =
 /// it is kept, and [`ProbeState::split`] gives both at once.
 pub struct ProbeState<'a, V: VTable> {
     array: ArrayView<'a, V>,
-    retained: Option<&'a mut RepeatedState<EncodingProbeState<V>>>,
+    retained: Option<Retained<'a, V>>,
+}
+
+/// What a repeated read borrows from its [`RepeatedArrayProbe`].
+struct Retained<'a, V: VTable> {
+    state: &'a mut RepeatedState<EncodingProbeState<V>>,
+    validity: &'a mut RetainedValidity,
 }
 
 impl<'a, V: VTable> ProbeState<'a, V> {
@@ -170,11 +185,12 @@ impl<'a, V: VTable> ProbeState<'a, V> {
     #[inline]
     pub(crate) fn repeated(
         array: ArrayView<'a, V>,
-        retained: &'a mut RepeatedState<EncodingProbeState<V>>,
+        state: &'a mut RepeatedState<EncodingProbeState<V>>,
+        validity: &'a mut RetainedValidity,
     ) -> Self {
         Self {
             array,
-            retained: Some(retained),
+            retained: Some(Retained { state, validity }),
         }
     }
 
@@ -184,13 +200,30 @@ impl<'a, V: VTable> ProbeState<'a, V> {
         self.array
     }
 
+    /// Whether the row at `index` of the array being read is valid.
+    ///
+    /// For encodings that hold their own validity (leaves, or wrappers whose validity is not a
+    /// child's): a repeated read resolves the validity once and keeps it, a one-off read resolves
+    /// it afresh. Wrapper encodings that read through a child should not call this: the child's
+    /// scalar already carries its nullness, and checking here would walk the tree twice.
+    #[inline]
+    pub fn is_valid(&mut self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+        let array = self.array.array();
+        match &mut self.retained {
+            None => is_valid_once(array, index, ctx),
+            Some(retained) => retained.validity.is_valid(array, index, ctx),
+        }
+    }
+
     /// The encoding's retained state, or `None` for a one-off read.
     ///
     /// Encodings whose repeated algorithm differs from their one-off one branch on this. To hold
     /// the state while reading children, use [`Self::split`].
     #[inline]
     pub fn retained(&mut self) -> Option<&mut EncodingProbeState<V>> {
-        self.retained.as_deref_mut().map(RepeatedState::state_mut)
+        self.retained
+            .as_mut()
+            .map(|retained| retained.state.state_mut())
     }
 
     /// The encoding's retained state and the array's children, borrowed apart, so a cache can
@@ -201,7 +234,7 @@ impl<'a, V: VTable> ProbeState<'a, V> {
         match &mut self.retained {
             None => (None, ProbeChildren { array, slots: None }),
             Some(repeated) => {
-                let (state, slots) = repeated.split_mut();
+                let (state, slots) = repeated.state.split_mut();
                 let children = ProbeChildren {
                     array,
                     slots: Some(slots),
@@ -221,7 +254,8 @@ impl<'a, V: VTable> ProbeState<'a, V> {
         match &mut self.retained {
             None => Ok(child_of(parent, slot)?.map(ArrayProbe::Once)),
             Some(repeated) => {
-                Ok(child_probe(repeated.split_mut().1, parent, slot)?.map(ArrayProbe::Repeated))
+                Ok(child_probe(repeated.state.split_mut().1, parent, slot)?
+                    .map(ArrayProbe::Repeated))
             }
         }
     }
@@ -268,6 +302,8 @@ mod tests {
     use super::*;
     use crate::VortexSessionExecute;
     use crate::array::IntoArray;
+    use crate::arrays::BoolArray;
+    use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::Struct;
     use crate::arrays::StructArray;
@@ -292,6 +328,44 @@ mod tests {
         let mut ctx = crate::array_session().create_execution_ctx();
         let array = nullable_ints();
         check_reads(array.probe(), &mut ctx)
+    }
+
+    /// Bool has no `probe_scalar` of its own, so this reads through the default that checks
+    /// validity before `scalar_at`.
+    #[test]
+    fn default_probe_scalar_resolves_nulls() -> VortexResult<()> {
+        let mut ctx = crate::array_session().create_execution_ctx();
+        let array = BoolArray::from_iter([Some(true), None, Some(false)]).into_array();
+        check_bool_reads(array.probe(), &mut ctx)?;
+        check_bool_reads(array.repeated_probe().as_probe(), &mut ctx)
+    }
+
+    fn check_bool_reads(mut probe: ArrayProbe<'_>, ctx: &mut ExecutionCtx) -> VortexResult<()> {
+        assert_eq!(probe.execute_scalar(0, ctx)?, Scalar::from(Some(true)));
+        assert!(probe.execute_scalar(1, ctx)?.is_null());
+        assert_eq!(probe.execute_scalar(2, ctx)?, Scalar::from(Some(false)));
+        Ok(())
+    }
+
+    /// A null reached through a child comes back from the wrapper as a null of the wrapper's
+    /// dtype, on both the one-off and the retained path.
+    #[test]
+    fn wrapper_passes_child_nulls_through() -> VortexResult<()> {
+        let mut ctx = crate::array_session().create_execution_ctx();
+        let codes = PrimitiveArray::from_iter([0u32, 1, 0, 2]).into_array();
+        let values = PrimitiveArray::from_option_iter([Some(7i64), None, Some(9)]).into_array();
+        let array = DictArray::try_new(codes, values)?.into_array();
+        let expected = [Some(7i64), None, Some(7), Some(9)];
+        let mut once = array.probe();
+        let mut repeated = array.repeated_probe();
+        for (index, value) in expected.into_iter().enumerate() {
+            assert_eq!(once.execute_scalar(index, &mut ctx)?, Scalar::from(value));
+            assert_eq!(
+                repeated.execute_scalar(index, &mut ctx)?,
+                Scalar::from(value)
+            );
+        }
+        Ok(())
     }
 
     #[test]

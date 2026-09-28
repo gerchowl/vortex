@@ -222,7 +222,8 @@ pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ExecutionResult>;
 
-    /// Read a non-null scalar at `index` for a one-off access; nothing is retained.
+    /// Read the scalar at `index`, including its nullness, for a one-off access; nothing is
+    /// retained. Bounds have been checked.
     ///
     /// Kept apart from [`Self::probe_scalar_retained`] so this entry is a bare trampoline into
     /// the encoding: sharing one function made the one-off path pay the retained branch's
@@ -234,12 +235,14 @@ pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar>;
 
-    /// Read a non-null scalar at `index`, keeping preparation in `state` for later reads.
+    /// Read the scalar at `index`, keeping preparation in `state` and the resolved validity in
+    /// `validity` for later reads.
     fn probe_scalar_retained(
         &self,
         this: &ArrayRef,
         index: usize,
         state: &mut Option<Box<dyn Any>>,
+        validity: &mut RetainedValidity,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar>;
 }
@@ -528,11 +531,12 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
         this: &ArrayRef,
         index: usize,
         state: &mut Option<Box<dyn Any>>,
+        validity: &mut RetainedValidity,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
         // SAFETY: this adapter belongs to the ArrayData<V> stored in `this`.
         let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
-        let mut state = ProbeState::repeated(view, repeated_state(state)?);
+        let mut state = ProbeState::repeated(view, repeated_state(state)?, validity);
         <V::OperationsVTable as OperationsVTable<V>>::probe_scalar(&mut state, index, ctx)
     }
 }

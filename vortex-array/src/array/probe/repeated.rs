@@ -25,10 +25,8 @@ pub struct RepeatedArrayProbe {
     array: ArrayRef,
     /// The encoding's [`RepeatedState`], type-erased, created on the first read.
     state: Option<Box<dyn Any>>,
-    /// Resolved on the first read of a nullable array: `Some(valid)` for uniform validity,
-    /// otherwise `validity` holds a probe over the validity array, boxed because it is a probe.
-    uniform_validity: Option<bool>,
-    validity: Option<Box<RepeatedArrayProbe>>,
+    /// The array's validity, resolved on the first validity read.
+    validity: RetainedValidity,
 }
 
 impl RepeatedArrayProbe {
@@ -37,8 +35,7 @@ impl RepeatedArrayProbe {
         Self {
             array,
             state: None,
-            uniform_validity: None,
-            validity: None,
+            validity: RetainedValidity::default(),
         }
     }
 
@@ -54,48 +51,25 @@ impl RepeatedArrayProbe {
     }
 
     /// Read the scalar at `index`, including its nullness, reusing retained preparation.
+    ///
+    /// Nullness is the encoding's to resolve, so a wrapper encoding that reads through a child
+    /// walks the tree once rather than once for validity and again for the value.
     pub fn execute_scalar(&mut self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
-        if !self.execute_is_valid(index, ctx)? {
-            return Ok(Scalar::null(self.array.dtype().clone()));
-        }
-        let result =
-            self.array
-                .dyn_array()
-                .probe_scalar_retained(&self.array, index, &mut self.state, ctx);
+        check_bounds(&self.array, index)?;
+        let result = self.array.dyn_array().probe_scalar_retained(
+            &self.array,
+            index,
+            &mut self.state,
+            &mut self.validity,
+            ctx,
+        );
         check_dtype(&self.array, result)
     }
 
     /// Whether the row at `index` is valid, through the retained validity.
     pub fn execute_is_valid(&mut self, index: usize, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
         check_bounds(&self.array, index)?;
-        if !self.array.dtype().is_nullable() {
-            return Ok(true);
-        }
-        if let Some(valid) = self.uniform_validity {
-            return Ok(valid);
-        }
-        if self.validity.is_none() {
-            match self.array.validity()? {
-                Validity::NonNullable | Validity::AllValid => {
-                    self.uniform_validity = Some(true);
-                    return Ok(true);
-                }
-                Validity::AllInvalid => {
-                    self.uniform_validity = Some(false);
-                    return Ok(false);
-                }
-                Validity::Array(array) => {
-                    self.validity = Some(Box::new(RepeatedArrayProbe::new(array)));
-                }
-            }
-        }
-        self.validity
-            .as_mut()
-            .ok_or_else(|| vortex_err!("validity probe was just initialized"))?
-            .execute_scalar(index, ctx)?
-            .as_bool()
-            .value()
-            .ok_or_else(|| vortex_err!("validity value at index {index} is null"))
+        self.validity.is_valid(&self.array, index, ctx)
     }
 
     /// Whether the row at `index` is null.
@@ -105,6 +79,58 @@ impl RepeatedArrayProbe {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<bool> {
         Ok(!self.execute_is_valid(index, ctx)?)
+    }
+}
+
+/// A nullable array's validity, resolved on first use and kept between reads.
+///
+/// Uniform validity is remembered as a flag; otherwise a probe over the validity array is kept,
+/// boxed because it is itself a [`RepeatedArrayProbe`]. Kept apart from the encoding state so
+/// [`ProbeState::is_valid`](crate::ProbeState::is_valid) can reach it without knowing the
+/// encoding's state type.
+#[derive(Default)]
+pub struct RetainedValidity {
+    uniform: Option<bool>,
+    probe: Option<Box<RepeatedArrayProbe>>,
+}
+
+impl RetainedValidity {
+    /// Whether row `index` of `array` is valid. Bounds have been checked.
+    #[inline]
+    pub(crate) fn is_valid(
+        &mut self,
+        array: &ArrayRef,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<bool> {
+        if !array.dtype().is_nullable() {
+            return Ok(true);
+        }
+        if let Some(valid) = self.uniform {
+            return Ok(valid);
+        }
+        if self.probe.is_none() {
+            match array.validity()? {
+                Validity::NonNullable | Validity::AllValid => {
+                    self.uniform = Some(true);
+                    return Ok(true);
+                }
+                Validity::AllInvalid => {
+                    self.uniform = Some(false);
+                    return Ok(false);
+                }
+                Validity::Array(array) => {
+                    self.probe = Some(Box::new(RepeatedArrayProbe::new(array)));
+                }
+            }
+        }
+        self.probe
+            .as_mut()
+            .ok_or_else(|| vortex_err!("validity probe was just initialized"))?
+            .execute_scalar(index, ctx)?
+            .as_bool()
+            .value()
+            .ok_or_else(|| vortex_err!("validity value at index {index} is null"))
     }
 }
 
@@ -199,13 +225,13 @@ mod tests {
         let mut probe = RepeatedArrayProbe::new(array.clone());
         drop(array);
         assert!(probe.state.is_none());
-        assert!(probe.validity.is_none());
+        assert!(probe.validity.probe.is_none());
 
         check_reads(probe.as_probe(), &mut ctx)?;
 
         assert!(probe.state.is_some());
-        assert!(probe.validity.is_some());
-        assert!(probe.uniform_validity.is_none());
+        assert!(probe.validity.probe.is_some());
+        assert!(probe.validity.uniform.is_none());
         Ok(())
     }
 
@@ -215,8 +241,21 @@ mod tests {
         let array = PrimitiveArray::from_option_iter([Some(1i32), Some(2)]).into_array();
         let mut probe = array.repeated_probe();
         assert!(probe.execute_is_valid(1, &mut ctx)?);
-        assert_eq!(probe.uniform_validity, Some(true));
-        assert!(probe.validity.is_none());
+        assert_eq!(probe.validity.uniform, Some(true));
+        assert!(probe.validity.probe.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_probe_reads_null_rows_through_encoding() -> VortexResult<()> {
+        let mut ctx = crate::array_session().create_execution_ctx();
+        let array = PrimitiveArray::from_option_iter([Some(1i32), None]).into_array();
+        let mut probe = array.repeated_probe();
+        // Reading a scalar resolves validity inside the encoding, so the retained validity is
+        // populated without an explicit `execute_is_valid`.
+        assert!(probe.execute_scalar(1, &mut ctx)?.is_null());
+        assert!(probe.validity.probe.is_some());
+        assert_eq!(probe.execute_scalar(0, &mut ctx)?, Scalar::from(Some(1i32)));
         Ok(())
     }
 
@@ -228,8 +267,9 @@ mod tests {
             .as_opt::<Struct>()
             .ok_or_else(|| vortex_err!("expected a struct"))?;
         let mut repeated = RepeatedState::<()>::default();
+        let mut validity = RetainedValidity::default();
         {
-            let mut state = ProbeState::repeated(typed, &mut repeated);
+            let mut state = ProbeState::repeated(typed, &mut repeated, &mut validity);
             assert!(state.slot(5).is_err());
             assert!(state.slot(0)?.is_none());
             assert!(state.retained().is_some());
