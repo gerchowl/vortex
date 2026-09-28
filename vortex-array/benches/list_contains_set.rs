@@ -120,12 +120,14 @@ fn bench_in_set(bencher: Bencher, set: Scalar, needles: ArrayRef) {
     let session = vortex_array::array_session();
     // Optimized as a scan optimizes it, so the set arrives normalized.
     let expr = list_contains(lit(set), root())
-        .optimize_recursive(needles.dtype())
+        .bind(needles.dtype())
+        .unwrap()
+        .optimize_recursive()
         .unwrap();
     bencher
         .with_inputs(|| {
             (
-                needles.clone().apply(&expr).unwrap(),
+                needles.clone().apply_bound(&expr).unwrap(),
                 session.create_execution_ctx(),
             )
         })
