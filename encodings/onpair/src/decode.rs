@@ -40,8 +40,9 @@ pub(crate) fn code_boundary_at(
     codes_offsets
         .execute_scalar(index, ctx)?
         .as_primitive()
-        .as_::<usize>()
-        .ok_or_else(|| vortex_err!("OnPair codes_offsets[{index}] is null"))
+        .as_opt::<usize>()
+        .flatten()
+        .ok_or_else(|| vortex_err!("OnPair codes_offsets[{index}] is null, negative, or too large"))
 }
 
 /// A validated, materialised window over an array's `codes`: the widened
