@@ -57,7 +57,7 @@ pub enum ReduceNodeValidity<T: ReduceNode> {
 }
 
 /// IsNotNull(child) as a reducible node
-pub fn is_not_null_node<T: ReduceNode>(child: &T) -> VortexResult<T> {
+pub(crate) fn is_not_null_node<T: ReduceNode>(child: &T) -> VortexResult<T> {
     child.new_node(IsNotNull.bind(EmptyOptions), std::slice::from_ref(child))
 }
 
