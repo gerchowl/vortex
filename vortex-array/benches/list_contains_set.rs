@@ -118,7 +118,7 @@ fn utf8_needles(needles: &[String], chunks: usize) -> ArrayRef {
 
 fn bench_in_set(bencher: Bencher, set: Scalar, needles: ArrayRef) {
     let session = vortex_array::array_session();
-    // Optimized as a scan optimizes it, so the set arrives normalized.
+    // Optimized as a scan optimizes it.
     let expr = list_contains(lit(set), root())
         .bind(needles.dtype())
         .unwrap()

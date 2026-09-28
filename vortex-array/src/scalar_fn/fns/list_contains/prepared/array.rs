@@ -233,8 +233,9 @@ const PARENT_RULES: ParentRuleSet<PreparedSet> = ParentRuleSet::new(&[
 
 /// Folds `list_contains` of a constant needle against the prepared set into its constant answer.
 ///
-/// [`ListContains::reduce`] folds a [`ConstantArray`] list the same way. This rule covers the list
-/// after it is prepared, which the generic constant check does not see.
+/// [`ListContains`] folds a [`ConstantArray`] list the same way in its
+/// [`reduce`](crate::scalar_fn::ScalarFnVTable::reduce). This rule covers the list after it is
+/// prepared, which the generic constant check does not see.
 #[derive(Debug)]
 struct ConstantNeedleRule;
 
