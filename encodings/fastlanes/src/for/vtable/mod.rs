@@ -16,6 +16,7 @@ use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
@@ -35,6 +36,7 @@ use crate::FoRData;
 use crate::r#for::array::FoRSlots;
 use crate::r#for::array::FoRSlotsView;
 use crate::r#for::array::for_decompress::decompress;
+use crate::r#for::array::num_chunks;
 use crate::r#for::vtable::rules::PARENT_RULES;
 
 mod kernels;
@@ -52,13 +54,13 @@ pub(crate) fn initialize(session: &VortexSession) {
 
 impl ArrayHash for FoRData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
-        self.reference.hash(state);
+        self.offset.hash(state);
     }
 }
 
 impl ArrayEq for FoRData {
     fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
-        self.reference == other.reference
+        self.offset == other.offset
     }
 }
 
@@ -80,8 +82,8 @@ impl VTable for FoR {
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        let encoded = FoRSlotsView::from_slots(slots).encoded;
-        validate_parts(encoded.dtype(), encoded.len(), &data.reference, dtype, len)
+        let slots = FoRSlotsView::from_slots(slots);
+        validate_parts(slots.encoded, slots.references, data.offset, dtype, len)
     }
 
     fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
@@ -150,10 +152,25 @@ impl FoR {
         let dtype = reference
             .dtype()
             .with_nullability(encoded.dtype().nullability());
-        let reference = reference.cast(&dtype)?;
+        let reference = reference.cast(&dtype.as_nonnullable())?;
+        let references = ConstantArray::new(reference, num_chunks(0, encoded.len())).into_array();
+        Self::try_new_chunked(encoded, references, 0)
+    }
+
+    /// Construct a FoR array with one reference per 1024-element chunk.
+    ///
+    /// `references` must be a non-nullable integer array of the encoded array's type, with one
+    /// entry for each chunk spanned by `offset + encoded.len()` elements. `offset` is the position
+    /// of the first element within the first chunk.
+    pub fn try_new_chunked(
+        encoded: ArrayRef,
+        references: ArrayRef,
+        offset: u16,
+    ) -> VortexResult<FoRArray> {
+        let dtype = encoded.dtype().clone();
         let len = encoded.len();
-        let data = FoRData::try_new(reference)?;
-        let slots = smallvec![Some(encoded)];
+        let data = FoRData::try_new(offset)?;
+        let slots = smallvec![Some(encoded), Some(references)];
         Array::try_from_parts(ArrayParts::new(FoR, dtype, len, data).with_slots(slots))
     }
 
@@ -164,27 +181,34 @@ impl FoR {
 }
 
 fn validate_parts(
-    encoded_dtype: &DType,
-    encoded_len: usize,
-    reference: &Scalar,
+    encoded: &ArrayRef,
+    references: &ArrayRef,
+    offset: u16,
     dtype: &DType,
     len: usize,
 ) -> VortexResult<()> {
     vortex_ensure!(dtype.is_int(), "FoR requires an integer dtype, got {dtype}");
     vortex_ensure!(
-        reference.dtype() == dtype,
-        "FoR reference dtype mismatch: expected {dtype}, got {}",
-        reference.dtype()
-    );
-    vortex_ensure!(
-        encoded_dtype == dtype,
+        encoded.dtype() == dtype,
         "FoR encoded dtype mismatch: expected {dtype}, got {}",
-        encoded_dtype
+        encoded.dtype()
     );
     vortex_ensure!(
-        encoded_len == len,
+        encoded.len() == len,
         "FoR encoded length mismatch: expected {len}, got {}",
-        encoded_len
+        encoded.len()
+    );
+    let references_dtype = dtype.as_nonnullable();
+    vortex_ensure!(
+        references.dtype() == &references_dtype,
+        "FoR references dtype mismatch: expected {references_dtype}, got {}",
+        references.dtype()
+    );
+    let num_chunks = num_chunks(offset, len);
+    vortex_ensure!(
+        references.len() == num_chunks,
+        "FoR expects {num_chunks} references, got {}",
+        references.len()
     );
     Ok(())
 }

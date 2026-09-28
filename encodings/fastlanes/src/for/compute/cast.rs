@@ -21,10 +21,10 @@ impl CastReduce for FoR {
 
         // For type changes between integers, cast the components
         let casted_child = array.encoded().cast(dtype.clone())?;
-        let casted_reference = array.reference_scalar().cast(dtype)?;
+        let casted_references = array.references().cast(dtype.as_nonnullable())?;
 
         Ok(Some(
-            FoR::try_new(casted_child, casted_reference)?.into_array(),
+            FoR::try_new_chunked(casted_child, casted_references, array.offset())?.into_array(),
         ))
     }
 }

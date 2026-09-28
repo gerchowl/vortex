@@ -83,7 +83,10 @@ mod test {
         let mut ctx = SESSION.create_execution_ctx();
         let array = PrimitiveArray::new((1i32..10).collect::<Buffer<_>>(), Validity::NonNullable);
         let compressed = FoRData::encode(array.clone(), &mut ctx).unwrap();
-        assert_eq!(i32::try_from(compressed.reference_scalar()).unwrap(), 1);
+        assert_eq!(
+            i32::try_from(&compressed.constant_reference().unwrap()).unwrap(),
+            1
+        );
 
         assert_arrays_eq!(compressed, array, &mut ctx);
     }
@@ -98,7 +101,7 @@ mod test {
         );
         let compressed = FoRData::encode(array, &mut ctx).unwrap();
         assert_eq!(
-            u32::try_from(compressed.reference_scalar()).unwrap(),
+            u32::try_from(&compressed.constant_reference().unwrap()).unwrap(),
             1_000_000u32
         );
     }
@@ -111,8 +114,14 @@ mod test {
 
         let dtype = array.dtype().clone();
         let compressed = FoRData::encode(array, &mut ctx).unwrap();
-        assert_eq!(compressed.reference_scalar().dtype(), &dtype);
-        assert!(compressed.reference_scalar().dtype().is_signed_int());
+        assert_eq!(compressed.constant_reference().unwrap().dtype(), &dtype);
+        assert!(
+            compressed
+                .constant_reference()
+                .unwrap()
+                .dtype()
+                .is_signed_int()
+        );
         assert!(compressed.encoded().dtype().is_signed_int());
 
         let encoded = compressed.encoded().execute_scalar(0, &mut ctx).unwrap();
@@ -160,7 +169,8 @@ mod test {
         assert_eq!(
             i8::MIN,
             compressed
-                .reference_scalar()
+                .constant_reference()
+                .unwrap()
                 .as_primitive()
                 .typed_value::<i8>()
                 .unwrap()

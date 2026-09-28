@@ -57,10 +57,15 @@ impl CudaExecute for FoRExecutor {
     ) -> VortexResult<Canonical> {
         let array = Self::try_specialize(array).ok_or_else(|| vortex_err!("Expected FoRArray"))?;
 
+        // Per-chunk references have no CUDA kernel yet, so decode them on the CPU.
+        let Some(reference) = array.constant_reference() else {
+            return array.into_array().execute::<Canonical>(ctx.execution_ctx());
+        };
+
         // Fuse FOR + BP => FFOR
         if let Some(bitpacked) = array.encoded().as_opt::<BitPacked>() {
             match_each_integer_ptype!(bitpacked.ptype(bitpacked.dtype()), |P| {
-                let reference: P = array.reference_scalar().try_into()?;
+                let reference: P = (&reference).try_into()?;
                 return decode_bitpacked(bitpacked.into_owned(), reference, None, ctx).await;
             })
         }
@@ -71,7 +76,7 @@ impl CudaExecute for FoRExecutor {
         {
             let slice_range = slice_array.slice_range().clone();
             let unpacked = match_each_integer_ptype!(bitpacked.ptype(bitpacked.dtype()), |P| {
-                let reference: P = array.reference_scalar().try_into()?;
+                let reference: P = (&reference).try_into()?;
                 decode_bitpacked(bitpacked.into_owned(), reference, None, ctx).await?
             });
 
@@ -95,7 +100,8 @@ where
     vortex_ensure!(array_len > 0, "FoR encoded array must not be empty");
 
     let reference: P = array
-        .reference_scalar()
+        .constant_reference()
+        .ok_or_else(|| vortex_err!("CUDA FoR decoding requires a constant reference"))?
         .as_primitive()
         .as_::<P>()
         .vortex_expect("Cannot have a null reference");

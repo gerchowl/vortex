@@ -10,6 +10,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use super::FoR;
+use crate::FL_CHUNK_SIZE;
 use crate::r#for::array::FoRArrayExt;
 use crate::r#for::array::FoRArraySlotsExt;
 impl OperationsVTable<FoR> for FoR {
@@ -22,7 +23,8 @@ impl OperationsVTable<FoR> for FoR {
     ) -> VortexResult<Scalar> {
         let encoded_pvalue = array.encoded().execute_scalar(index, ctx)?;
         let encoded_pvalue = encoded_pvalue.as_primitive();
-        let reference = array.reference_scalar();
+        let chunk = (usize::from(array.offset()) + index) / FL_CHUNK_SIZE;
+        let reference = array.references().execute_scalar(chunk, ctx)?;
         let reference = reference.as_primitive();
 
         Ok(match_each_integer_ptype!(array.ptype(), |P| {
@@ -35,8 +37,8 @@ impl OperationsVTable<FoR> for FoR {
                             .vortex_expect("FoRArray Reference value cannot be null"),
                     )
                 })
-                .map(|v| Scalar::primitive::<P>(v, array.reference_scalar().dtype().nullability()))
-                .unwrap_or_else(|| Scalar::null(array.reference_scalar().dtype().clone()))
+                .map(|v| Scalar::primitive::<P>(v, array.dtype().nullability()))
+                .unwrap_or_else(|| Scalar::null(array.dtype().clone()))
         }))
     }
 }

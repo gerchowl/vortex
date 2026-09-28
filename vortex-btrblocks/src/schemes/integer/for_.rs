@@ -146,7 +146,11 @@ impl Scheme for FoRScheme {
         let compressed = BitPackingScheme.compress(compressor, &biased_data, leaf_ctx, exec_ctx)?;
 
         // TODO(connor): This should really be `new_unchecked`.
-        let for_compressed = FoR::try_new(compressed, for_array.reference_scalar().clone())?;
+        let for_compressed = FoR::try_new_chunked(
+            compressed,
+            for_array.references().clone(),
+            for_array.offset(),
+        )?;
         for_compressed
             .as_ref()
             .statistics()

@@ -3,10 +3,8 @@
 
 //! ArrayPlugin implementation for FoR.
 
-use vortex_array::Array;
 use vortex_array::ArrayDeserialization;
 use vortex_array::ArrayId;
-use vortex_array::ArrayParts;
 use vortex_array::ArrayPlugin;
 use vortex_array::ArrayRef;
 use vortex_array::ArraySerialization;
@@ -14,7 +12,6 @@ use vortex_array::IntoArray;
 use vortex_array::VTable;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
-use vortex_array::smallvec::smallvec;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -22,8 +19,8 @@ use vortex_error::vortex_err;
 use vortex_session::VortexSession;
 
 use crate::FoR;
-use crate::FoRData;
 use crate::r#for::array::FoRArrayExt;
+use crate::r#for::array::FoRArraySlotsExt;
 
 /// Serde for the [`FoR`] array.
 ///
@@ -45,12 +42,16 @@ impl ArrayPlugin for FoRPlugin {
         let view = array
             .as_opt::<FoR>()
             .ok_or_else(|| vortex_err!("FoR plugin cannot serialize {}", array.encoding_id()))?;
+        let reference = view
+            .constant_reference()
+            .ok_or_else(|| vortex_err!("FoR plugin requires constant references"))?;
         // Note that we **only** serialize the optional scalar value (not including the dtype).
-        let metadata = ScalarValue::to_proto_bytes(view.reference_scalar().value());
-        Ok(Some(ArraySerialization::from_array(
+        let metadata = ScalarValue::to_proto_bytes(reference.value());
+        Ok(Some(ArraySerialization::new(
             self.id(),
-            array,
             metadata,
+            vec![],
+            vec![view.encoded().clone()],
         )))
     }
 
@@ -79,13 +80,7 @@ impl ArrayPlugin for FoRPlugin {
         let scalar_value = ScalarValue::from_proto_bytes(parts.metadata, parts.dtype, session)?;
         let reference = Scalar::try_new(parts.dtype.clone(), scalar_value)?;
         let encoded = parts.children.get(0, parts.dtype, parts.len)?;
-        let slots = smallvec![Some(encoded)];
-
-        let data = FoRData::try_new(reference)?;
-        Ok(Array::try_from_parts(
-            ArrayParts::new(FoR, parts.dtype.clone(), parts.len, data).with_slots(slots),
-        )?
-        .into_array())
+        Ok(FoR::try_new(encoded, reference)?.into_array())
     }
 }
 
@@ -143,7 +138,7 @@ mod tests {
         assert_eq!(serialization.serialized_id, VTable::id(&FoR));
         assert_eq!(
             serialization.metadata,
-            ScalarValue::to_proto_bytes::<Vec<u8>>(array.reference_scalar().value())
+            ScalarValue::to_proto_bytes::<Vec<u8>>(array.constant_reference().unwrap().value())
         );
 
         let read = roundtrip(array.as_array())?;

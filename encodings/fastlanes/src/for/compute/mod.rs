@@ -25,23 +25,21 @@ impl TakeExecute for FoR {
         indices: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
+        let Some(reference) = array.constant_reference() else {
+            return Ok(None);
+        };
         Ok(Some(
-            FoR::try_new(
-                array.encoded().take(indices.clone())?,
-                array.reference_scalar().clone(),
-            )?
-            .into_array(),
+            FoR::try_new(array.encoded().take(indices.clone())?, reference)?.into_array(),
         ))
     }
 }
 
 impl FilterReduce for FoR {
     fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
-        FoR::try_new(
-            array.encoded().filter(mask.clone())?,
-            array.reference_scalar().clone(),
-        )
-        .map(|a| Some(a.into_array()))
+        let Some(reference) = array.constant_reference() else {
+            return Ok(None);
+        };
+        FoR::try_new(array.encoded().filter(mask.clone())?, reference).map(|a| Some(a.into_array()))
     }
 }
 
