@@ -9,7 +9,6 @@ use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
 use vortex_array::dtype::PType;
 use vortex_array::scalar::Scalar;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
@@ -44,15 +43,8 @@ pub struct FoRData {
 
 pub trait FoRArrayExt: FoRArraySlotsExt {
     /// The reference shared by every chunk, if the references are constant.
-    ///
-    /// The returned scalar has the array's dtype, including its nullability.
     fn constant_reference(&self) -> Option<Scalar> {
-        let reference = self.references().as_constant()?;
-        Some(
-            reference
-                .cast(self.as_ref().dtype())
-                .vortex_expect("non-nullable reference casts to its nullable dtype"),
-        )
+        self.references().as_constant()
     }
 
     /// The position of the first element within the first chunk of `references`.
