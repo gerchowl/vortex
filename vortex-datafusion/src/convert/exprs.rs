@@ -385,25 +385,21 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 })
                 .try_collect()?;
 
+            // A null literal is nullable and a non-null one is not. `Scalar::list` needs one
+            // element dtype, so make all elements nullable when any is.
+            let list_elements = if list_elements.iter().any(|e| e.dtype().is_nullable()) {
+                list_elements
+                    .into_iter()
+                    .map(Scalar::into_nullable)
+                    .collect()
+            } else {
+                list_elements
+            };
             let element_dtype = list_elements
                 .first()
                 .ok_or_else(|| exec_datafusion_err!("Cannot infer the type of an empty IN list"))?
                 .dtype()
-                .with_nullability(
-                    list_elements
-                        .iter()
-                        .fold(Nullability::NonNullable, |nullability, element| {
-                            nullability | element.dtype().nullability()
-                        }),
-                );
-            let list_elements = list_elements
-                .iter()
-                .map(|element| {
-                    element
-                        .cast(&element_dtype)
-                        .map_err(|e| exec_datafusion_err!("Invalid IN list element: {e}"))
-                })
-                .collect::<DFResult<Vec<_>>>()?;
+                .clone();
             let list = Scalar::list(element_dtype, list_elements, Nullability::NonNullable);
             let expr = in_list(value, lit(list));
 

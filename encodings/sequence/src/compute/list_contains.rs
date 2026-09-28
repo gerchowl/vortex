@@ -9,6 +9,8 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::list_contains::ListContainsElementReduce;
 use vortex_array::scalar_fn::fns::list_contains::ListContainsOptions;
+use vortex_array::validity::Validity;
+use vortex_buffer::BitBufferMut;
 use vortex_error::VortexResult;
 
 use crate::array::Sequence;
@@ -25,25 +27,18 @@ impl ListContainsElementReduce for Sequence {
             return Ok(None);
         };
 
-        // A null list scalar has no elements to intersect with. Nothing checks this before the
-        // reduce rule runs, so fall back to the generic implementation, which resolves a null
-        // haystack to all-null rather than panicking here.
+        // A null list falls back to the generic path, which yields all-null.
         let Some(list_elements) = list_scalar.as_list().elements() else {
             return Ok(None);
         };
 
-        // The intersection search treats a null element as matching nothing, which under SQL null
-        // semantics is only half the answer: there a non-match is unknown, which the search cannot
-        // express.
-        if options.sql_null_semantics && list_elements.iter().any(Scalar::is_null) {
-            return Ok(None);
-        }
-
         let nullability = options.result_nullability(list.dtype(), element.dtype());
 
-        let mut set_indices: Vec<usize> = Vec::new();
+        let mut matches = BitBufferMut::new_unset(element.len());
+        let mut has_null = false;
         for intercept in list_elements.iter() {
             let Some(intercept) = intercept.as_primitive().pvalue() else {
+                has_null = true;
                 continue;
             };
             match find_intersection(
@@ -54,7 +49,7 @@ impl ListContainsElementReduce for Sequence {
             ) {
                 // Non-integer elements do not match the sequence.
                 None | Some(Intersection::None) => {}
-                Some(Intersection::At(idx)) => set_indices.push(idx),
+                Some(Intersection::At(idx)) => matches.set(idx),
                 Some(Intersection::All) => {
                     return Ok(Some(
                         ConstantArray::new(Scalar::bool(true, nullability), element.len())
@@ -64,9 +59,16 @@ impl ListContainsElementReduce for Sequence {
             }
         }
 
-        Ok(Some(
-            BoolArray::from_indices(element.len(), set_indices, nullability.into()).into_array(),
-        ))
+        let matches = matches.freeze();
+
+        // Under SQL null semantics a null element makes every non-match unknown.
+        let validity = if options.sql_null_semantics && has_null {
+            Validity::from_bit_buffer(matches.clone(), nullability)
+        } else {
+            nullability.into()
+        };
+
+        Ok(Some(BoolArray::new(matches, validity).into_array()))
     }
 }
 
@@ -137,8 +139,7 @@ mod tests {
 
     #[test]
     fn test_list_contains_null_list() {
-        // A null haystack resolves to null for every row. The reduce rule used to assume the list
-        // scalar was non-null and panicked instead of declining the reduction.
+        // A null list yields null for every row. The reduce rule used to panic on it.
         let array = Sequence::try_new_typed(1, 1, Nullability::NonNullable, 3)
             .unwrap()
             .into_array();
@@ -152,9 +153,8 @@ mod tests {
 
     #[test]
     fn test_list_contains_null_element_semantics() {
-        // The sequence kernel skips a null element, which is right by default. Under SQL null
-        // semantics a non-match must be null instead, so a constant list holding a null goes to
-        // the generic path instead.
+        // By default a null element matches nothing. Under SQL null semantics it makes every
+        // non-match null.
         let element = DType::Primitive(I32, Nullability::Nullable);
         let set = Scalar::list(
             Arc::new(element.clone()),

@@ -21,6 +21,7 @@ use vortex_session::registry::CachedId;
 use vortex_utils::iter::ReduceBalancedIterExt;
 
 use crate::ArrayRef;
+use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::BoolArray;
@@ -290,25 +291,21 @@ fn compute_list_contains(
     }
 
     if let Some(list_scalar) = array.as_constant() {
-        return constant_list_scalar_contains(
-            &list_scalar.as_list(),
-            value,
-            nullability,
-            options,
-            ctx,
-        );
+        return constant_list_scalar_contains(&list_scalar.as_list(), value, nullability, options);
     }
 
     todo!("unsupported list contains with list and element as arrays")
 }
 
 /// There is a constant list scalar (haystack) being compared to an array of needles.
+///
+/// The result stays lazy. `Or` is Kleene, so under SQL null semantics the disjunction of the raw
+/// comparisons is already the `IN` answer.
 fn constant_list_scalar_contains(
     list_scalar: &ListScalar,
     values: &ArrayRef,
     nullability: Nullability,
     options: &ListContainsOptions,
-    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let elements = list_scalar.elements().vortex_expect("non null");
     let len = values.len();
@@ -333,21 +330,24 @@ fn constant_list_scalar_contains(
         .into_iter()
         .try_reduce_balanced(|acc, res| acc.binary(res, Operator::Or))?;
 
-    let matches = result
-        .unwrap_or_else(|| ConstantArray::new(false_scalar, len).into_array())
-        .execute::<BoolArray>(ctx)?;
-    let validity = if elements.is_empty() && !options.sql_null_semantics {
-        Validity::NonNullable
-    } else if options.sql_null_semantics {
-        matches.validity()?.and(values.validity()?)?
+    let mut result = result.unwrap_or_else(|| ConstantArray::new(false_scalar, len).into_array());
+
+    // A null needle must still yield null where nothing above keeps it: off SQL null semantics
+    // `fill_null` erases it, and under them an empty list has no comparison to carry it.
+    let erases_null_needle = if options.sql_null_semantics {
+        elements.is_empty()
     } else {
-        values.validity()?
+        !elements.is_empty()
     };
-    Ok(BoolArray::new(
-        matches.to_bit_buffer(),
-        validity.union_nullability(nullability),
-    )
-    .into_array())
+    if erases_null_needle && values.dtype().is_nullable() {
+        result = result.mask(values.is_not_null()?)?;
+    }
+
+    if result.dtype().nullability() != nullability {
+        result = result.cast(DType::Bool(nullability))?;
+    }
+
+    Ok(result)
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -380,10 +380,23 @@ fn list_contains_scalar(
 
     let rhs = ConstantArray::new(value.clone(), elems.len());
     let matching_elements =
-        Binary::try_new(elems.clone(), rhs.clone().into_array(), Operator::Eq)?.into_array();
+        Binary::try_new(elems.clone(), rhs.into_array(), Operator::Eq)?.into_array();
 
-    // TODO(ngates): we should execute this into a Columnar and check for constant.
-    let mut matches = matching_elements.execute::<BoolArray>(ctx)?;
+    let mut matches = match matching_elements.execute::<Columnar>(ctx)? {
+        Columnar::Constant(constant) => {
+            return match constant.scalar().as_bool().value() {
+                // The needle is not null, so every comparison is null only if every element is.
+                None if options.sql_null_semantics => {
+                    null_needle_in_lists(&list_array, nullability, ctx)
+                }
+                // No element matches: false, unless the list itself is null.
+                None | Some(false) => list_false_or_null(&list_array, nullability, ctx),
+                // Every element matches: true, unless the list itself is empty or null.
+                Some(true) => list_is_not_empty(&list_array, nullability, ctx),
+            };
+        }
+        Columnar::Canonical(canonical) => canonical.into_bool(),
+    };
     let valid = matches.validity()?.execute_mask(matches.len(), ctx)?;
 
     // Under SQL null semantics a list holding a null element answers `null` for a needle that
@@ -415,29 +428,6 @@ fn list_contains_scalar(
             &matches.to_bit_buffer() & &valid.to_bit_buffer(),
             Validity::NonNullable,
         );
-    }
-
-    // Fast path: no elements match.
-    if let Some(pred) = matches.as_constant() {
-        return match pred.as_bool().value() {
-            // All comparisons are invalid (result in `null`), and search is not null because
-            // we already checked for null above.
-            None => {
-                assert!(
-                    !rhs.scalar().is_null(),
-                    "Search value must not be null here"
-                );
-                // False, unless the list itself is null in which case we return null.
-                list_false_or_null(&list_array, nullability, ctx)
-            }
-            // No elements match, and all comparisons are valid (result in `false`).
-            Some(false) => list_false_or_null(&list_array, nullability, ctx),
-            // All elements match, and all comparisons are valid (result in `true`).
-            Some(true) => {
-                // True, unless the list itself is empty or NULL.
-                list_is_not_empty(&list_array, nullability, ctx)
-            }
-        };
     }
 
     let list_matches = fold_lists(matches, &list_array, ctx)?;
@@ -539,8 +529,10 @@ fn list_false_or_null(
     }
 }
 
-/// A null needle against each list, off SQL null semantics: `false` for an empty list, which holds
-/// nothing to compare it to, and `null` for any other list.
+/// `false` for an empty list, which holds nothing to compare against, and `null` for any other list.
+///
+/// This is a null needle off SQL null semantics, or under them a needle against lists that hold
+/// only nulls.
 fn null_needle_in_lists(
     list_array: &ListViewArray,
     nullability: Nullability,
