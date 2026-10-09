@@ -266,7 +266,10 @@ mod tests {
         let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
         let read = StatsSet::from_flatbuffer(&fb, &dtype, &array_session())?;
         Ok(read
-            .get_as::<f64>(Stat::Sum, &DType::Primitive(PType::F64, Nullability::Nullable))
+            .get_as::<f64>(
+                Stat::Sum,
+                &DType::Primitive(PType::F64, Nullability::Nullable),
+            )
             .as_exact()
             .ok_or_else(|| vortex_err!("sum must be exact after a round trip"))?
             .to_bits())
@@ -285,7 +288,10 @@ mod tests {
         );
 
         assert_eq!(roundtrip_sum(3.0)?, 3.0f64.to_bits());
-        assert_eq!(roundtrip_sum(f64::NEG_INFINITY)?, f64::NEG_INFINITY.to_bits());
+        assert_eq!(
+            roundtrip_sum(f64::NEG_INFINITY)?,
+            f64::NEG_INFINITY.to_bits()
+        );
 
         Ok(())
     }
